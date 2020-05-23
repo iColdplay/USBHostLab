@@ -1,0 +1,2 @@
+rootProject.name='USBHostLab'
+include ':app'
