@@ -33,6 +33,7 @@ import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Locale;
+import java.util.Random;
 import java.util.TreeMap;
 import java.util.concurrent.SynchronousQueue;
 
@@ -43,6 +44,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
 
     private UsbDevice currentDevice;
     private volatile UsbDeviceConnection mUsbDeviceConnection;
+    private volatile  UsbInterface mUsbInterface;
     private volatile UsbEndpoint mUsbEndpointOut;
     private volatile UsbEndpoint mUsbEndpointIn;
 
@@ -130,6 +132,16 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             }
         };
         mContext.registerReceiver(afterAccessoryPermissionReceiver, afterAccessoryFilter);
+
+        //USB device detached broadcast
+        IntentFilter intentFilter = new IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED);
+        BroadcastReceiver usbDetachedReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                onDetached();
+            }
+        };
+        mContext.registerReceiver(usbDetachedReceiver, intentFilter);
     }
 
     private void initView(){
@@ -182,7 +194,19 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             if (deviceName.matches("p.+") || deviceName.toLowerCase().contains("redmi") || deviceName.toLowerCase().contains("tai")) {
                 PendingIntent pendingIntent = PendingIntent.getBroadcast(mContext, 0, new Intent(USB_ACTION), 0);
                 android.util.Log.i("mark61","before AOA, usb device info--->" + usbDevice.toString());
-                mUsbManager.requestPermission(usbDevice, pendingIntent);
+                int productId = usbDevice.getProductId();
+                boolean isAlreadyAOADevice = false;
+                if (productId == 0x2D00 || productId == 0x2D01) {
+                    isAlreadyAOADevice = true;
+                }
+                if(!isAlreadyAOADevice) {
+                    showLog("device is not AOA, just go to request it's permission...");
+                    mUsbManager.requestPermission(usbDevice, pendingIntent);
+                }else {
+                    showLog("device is already AOA, just go to open it...");
+                    OpenAOADeviceThread t = new OpenAOADeviceThread();
+                    t.start();
+                }
                 isMatch = true;
                 break;
             }
@@ -202,11 +226,15 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             showByAlertDialog("No device is opened...", "");
         }else {
             stopReadThread();
+            if(mUsbInterface != null){
+                mUsbDeviceConnection.releaseInterface(mUsbInterface);
+            }
             if (mUsbDeviceConnection != null) {
                 mUsbDeviceConnection.close();
             }
             mUsbEndpointIn = null;
             mUsbEndpointOut = null;
+            mUsbInterface = null;
             mUsbDeviceConnection = null;
             currentDevice = null;
             showByAlertDialog("Success", "device is closed...");
@@ -244,7 +272,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
         }else {
             readThread.interrupt();
             readThread = null;
-            showByAlertDialog("Sucess", "ReadThread is not running now");
+            showByAlertDialog("Success", "ReadThread is not running now");
         }
     }
 
@@ -273,13 +301,15 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             showByAlertDialog("Failed", "open usb device failed");
             return;
         }
+
         //use AOA protocol to make target device convert into AccessoryMode
         initControlTransfer(usbDeviceConnection, 0, "Sunmi"); // MANUFACTURER
         initControlTransfer(usbDeviceConnection, 1, "K1P1"); // MODEL
         initControlTransfer(usbDeviceConnection, 2, "K1P1 comm"); // DESCRIPTION
         initControlTransfer(usbDeviceConnection, 3, "1.0"); // VERSION
         initControlTransfer(usbDeviceConnection, 4, "http://www.sunmi.com"); // URI
-        initControlTransfer(usbDeviceConnection, 5, "0123456789"); // SERIAL
+
+        initControlTransfer(usbDeviceConnection, 5, System.currentTimeMillis() + ""); // SERIAL
         usbDeviceConnection.controlTransfer(0x40, 53, 0, 0, new byte[]{}, 0, 100);
         usbDeviceConnection.close();
 
@@ -308,9 +338,8 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                     }
                     UsbDevice targetDevice = null;
                     for (UsbDevice usbDevice : deviceList.values()) {
-                        String deviceName = getCompatibleName(usbDevice, 21, "getProductName", null);
                         int productId = usbDevice.getProductId();
-                        if (productId == 0x2D00 || productId == 0x2D01 || deviceName.matches("p.+")) {
+                        if (productId == 0x2D00 || productId == 0x2D01) {
                             targetDevice = usbDevice;
                             break;
                         }
@@ -335,7 +364,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                     if (targetDevicePermissionGranted) {
                         currentDevice = targetDevice;
                         mUsbDeviceConnection = mUsbManager.openDevice(targetDevice);
-                        UsbInterface mUsbInterface = targetDevice.getInterface(0);
+                        mUsbInterface = targetDevice.getInterface(0);
                         int count = mUsbInterface.getEndpointCount();
                         for (int i = 0; i < count; i++) {
                             UsbEndpoint usbEndpoint = mUsbInterface.getEndpoint(i);
@@ -375,6 +404,12 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
         public void run() {
             super.run();
             while (!Thread.interrupted()){
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                    break;
+                }
                 int len = mUsbDeviceConnection.bulkTransfer(mUsbEndpointIn, readData, readData.length, 3 * 1000);
                 if (len >= 0) {
                     byte[] recv = Arrays.copyOf(readData, len);
@@ -386,6 +421,41 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 }
             }
         }
+    }
+
+    private void onDetached(){
+        Thread detachThread = new Thread(){
+            @Override
+            public void run() {
+                super.run();
+                mUsbManager = (UsbManager) mContext.getSystemService(Context.USB_SERVICE);
+                HashMap<String, UsbDevice> deviceList = mUsbManager.getDeviceList();
+
+                boolean causeByAOA = false;
+
+                try {
+                    Thread.sleep(3000);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+
+                for (UsbDevice device : mUsbManager.getDeviceList().values()) {
+                    int productId = device.getProductId();
+                    String deviceName = getCompatibleName(device, 21, "getProductName", null);
+                    if (productId == 0x2D00 || productId == 0x2D01 || deviceName.matches("p.+")) {
+                        causeByAOA = true;
+                        break;
+                    }
+                }
+
+                if (!causeByAOA) {
+                    close();
+                    showLog("clear finished!!!");
+                }else {
+                    showLog("we know this detach  is caused by AOA, do nothing");
+                }
+            }
+        };detachThread.start();
     }
 
 }
